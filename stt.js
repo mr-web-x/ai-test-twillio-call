@@ -2,7 +2,7 @@ const speech = require("@google-cloud/speech");
 const { PassThrough } = require("stream");
 
 class GoogleSTTStream {
-  constructor(lang = "sk-SK") {
+  constructor(lang = "ru-RU") {
     this.client = new speech.SpeechClient();
     this.audioStream = new PassThrough();
     this.callbacks = [];
@@ -48,13 +48,13 @@ class GoogleSTTStream {
           singleUtterance: false, // Продолжаем слушать
         })
         .on("data", (data) => {
-          console.log("📊 Получены данные от Google STT:", {
-            resultsLength: data.results?.length,
-            hasResults: !!data.results?.[0],
-            isFinal: data.results?.[0]?.isFinal,
-            transcript: data.results?.[0]?.alternatives?.[0]?.transcript,
-            confidence: data.results?.[0]?.alternatives?.[0]?.confidence,
-          });
+          // console.log("📊 Получены данные от Google STT:", {
+          //   resultsLength: data.results?.length,
+          //   hasResults: !!data.results?.[0],
+          //   isFinal: data.results?.[0]?.isFinal,
+          //   transcript: data.results?.[0]?.alternatives?.[0]?.transcript,
+          //   confidence: data.results?.[0]?.alternatives?.[0]?.confidence,
+          // });
 
           if (data.results?.[0]) {
             const result = data.results[0];
@@ -66,7 +66,7 @@ class GoogleSTTStream {
               );
               this.callbacks.forEach((cb) => cb(transcript));
             } else {
-              console.log(`🔄 Промежуточный текст: "${transcript}"`);
+              // console.log(`🔄 Промежуточный текст: "${transcript}"`);
             }
           }
         })

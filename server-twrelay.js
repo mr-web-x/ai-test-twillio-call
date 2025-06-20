@@ -1,5 +1,3 @@
-// server.js
-
 const express = require("express");
 const { WebSocketServer } = require("ws");
 const { createServer } = require("http");
@@ -14,11 +12,10 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(express.static("public"));
 
-// Webhook для обработки входящих звонков
-app.post("/api/webhooks/twiml", (req, res, next) => {
-  req.url = "/twiml";
-  next();
-});
+const pendingCalls = new Map();
+const activeCalls = new Map();
+const startMessage =
+  "Dobrý deň, volám sa Lenka. Zastupujem oddelenie vymáhania pohľadávok. Radi by sme s vami prediskutovali otázku vašej neuhradenej dlžoby. Tento hovor bude zaznamenávaný za účelom zlepšenia kvality služieb. Prosím, potvrďte, že môžete hovoriť.";
 
 app.post("/call", async (req, res) => {
   const { to } = req.body;
@@ -30,10 +27,12 @@ app.post("/call", async (req, res) => {
 
   try {
     const call = await client.calls.create({
-      url: `${process.env.PUBLIC_HOST}/twiml`,
+      url: `${process.env.PUBLIC_HOST}/api/webhooks/twiml`,
       to,
       from,
     });
+
+    pendingCalls.set(call.sid, to);
 
     console.log(`📞 Звонок инициирован: ${call.sid} → ${to}`);
     res.json({ success: true, sid: call.sid });
@@ -43,25 +42,28 @@ app.post("/call", async (req, res) => {
   }
 });
 
-app.post("/twiml", (req, res) => {
+app.post("/api/webhooks/twiml", (req, res) => {
   try {
     const callSid = req.body.CallSid;
-    console.log(`📞 Исходящий звонок клиенту CallSid: ${callSid}`);
-    res.type("text/xml");
-    res.send(`
-      <Response>
-        <Connect>
-          <ConversationRelay url="${process.env.PUBLIC_WS}/conversation">
-            <Language
-          code="sk-SK"
-          ttsProvider="google"
-          voice="sk-SK-Standard-B"
-          transcriptionProvider="google"
-          speechModel="long" />
-          </ConversationRelay>
-        </Connect>
-      </Response> 
-        `);
+
+    const to = pendingCalls.get(callSid);
+
+    const callData = {
+      to,
+      dialog: [{ from: "ai", text: startMessage }],
+    };
+
+    activeCalls.set(callSid, callData);
+    pendingCalls.delete(callSid);
+    console.log(`📝 Создан новый диалог для ${callSid}`);
+
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+              <Response>
+                  <Connect>
+                      <ConversationRelay url="${process.env.PUBLIC_WS}/conversation" transcriptionLanguage="sk-SK" transcriptionProvider="Deepgram" ttsProvider="google" voice="sk-SK-Wavenet-B" welcomeGreeting="${startMessage}">
+                      </ConversationRelay>
+                  </Connect>
+              </Response>`);
   } catch (error) {
     console.log("ERROR -", error.message);
   }
@@ -100,6 +102,8 @@ const wss = new WebSocketServer({ noServer: true });
 wss.on("connection", (ws, req) => {
   console.log("🔌 ConversationRelay WebSocket подключен");
 
+  let currentCallSid = null;
+
   ws.on("message", async (data) => {
     let msg;
     try {
@@ -109,7 +113,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    console.log("📨 Получено сообщение:", msg);
+    // console.log("📨 Получено сообщение:", msg);
 
     // Обработка разных типов сообщений от ConversationRelay
     switch (msg.type) {
@@ -117,6 +121,8 @@ wss.on("connection", (ws, req) => {
         console.log(
           `🚀 Сессия начата: ${msg.sessionId}, CallSid: ${msg.callSid}`
         );
+
+        currentCallSid = msg.callSid;
 
         ws.send(
           JSON.stringify({
@@ -126,14 +132,13 @@ wss.on("connection", (ws, req) => {
           })
         );
 
-        ws.send(
-          JSON.stringify({
-            type: "text",
-            token:
-              "Dobrý deň, volám sa Lenka. Zastupujem oddelenie vymáhania pohľadávok. Radi by sme s vami prediskutovali otázku vašej neuhradenej dlžoby. Tento hovor bude zaznamenávaný za účelom zlepšenia kvality služieb. Prosím, potvrďte, že môžete hovoriť.",
-            last: true,
-          })
-        );
+        // ws.send(
+        //   JSON.stringify({
+        //     type: "text",
+        //     token: startMessage,
+        //     last: true,
+        //   })
+        // );
 
         // Можно отправить дополнительные параметры или настройки
         if (msg.customParameters) {
@@ -147,13 +152,28 @@ wss.on("connection", (ws, req) => {
         const language = msg.lang;
         const isComplete = msg.last;
 
-        console.log(`🗣️ Клиент сказал (${language}): "${userText}"`);
+        const currentCallData = activeCalls.get(currentCallSid);
+
+        if (!currentCallData) {
+          console.error(`❌ CallData не найден для ${currentCallSid}`);
+          return;
+        }
+
+        currentCallData.dialog.push({ from: "client", text: userText });
+
+        console.log(
+          `[${new Date().toISOString()}] 🗣️ Клиент сказал (${language}): "${userText}"`
+        );
 
         if (isComplete) {
           try {
             // Генерируем ответ через вашу функцию
-            const reply = await generateReply(userText);
-            console.log(`🤖 Отправляем ответ: "${reply}"`);
+            const reply = await generateReply(userText, currentCallData.dialog);
+            currentCallData.dialog.push({ from: "ai", text: reply });
+
+            console.log(
+              `[${new Date().toISOString()}] 🤖 АИ сказал: "${reply}"`
+            );
 
             // Отправляем текстовый ответ ConversationRelay
             ws.send(
@@ -229,6 +249,17 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
+    const callData = activeCalls.get(currentCallSid);
+
+    if (callData) {
+      console.log(
+        "Финальный диалог:",
+        JSON.stringify(callData.dialog, null, 2)
+      );
+      // Здесь ваш код сохранения
+      activeCalls.delete(currentCallSid); // Очищаем память
+    }
+
     console.log("🔌 ConversationRelay WebSocket отключен");
   });
 });
