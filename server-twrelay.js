@@ -2,7 +2,7 @@ const express = require("express");
 const { WebSocketServer } = require("ws");
 const { createServer } = require("http");
 const bodyParser = require("body-parser");
-const { generateReply } = require("./gpt");
+const { generateReply, generateReplyWithStreaming } = require("./gpt");
 require("dotenv").config();
 
 const app = express();
@@ -20,12 +20,24 @@ const borrower = {
   vernut: 512,
 };
 
-//Radi by sme s vami prediskutovali otázku vašej neuhradenej dlžoby. Tento hovor bude zaznamenávaný za účelom zlepšenia kvality služieb.
-
 const pendingCalls = new Map();
 const activeCalls = new Map();
+const callTimeouts = new Map();
+const silenceTimeouts = new Map(); // 🎯 Таймауты для детекции молчания
+
+const CALL_TIMEOUT = 10 * 60 * 1000; // 10 минут
+const SILENCE_TIMEOUT = 5 * 1000; // 5 секунды молчания
+const MAX_SILENCE_PROMPTS = 2; // Максимум 3 переспроса
+
 const startMessage =
   "Dobrý deň, volám sa Lenka. Zastupujem oddelenie vymáhania pohľadávok. Prosím, potvrďte, že môžete hovoriť.";
+
+// 🎯 ФРАЗЫ ДЛЯ ПЕРЕСПРОСА ПРИ МОЛЧАНИИ
+const silencePrompts = [
+  "Počujem vás? Môžete odpovedať?", // Первый переспрос
+  "Dmitry, ste tam? Prosím, odpovedzte.", // Второй переспрос
+  "Zdá sa, že sa spojenie prerušilo. Ak ma počujete, prosím povedzte niečo.", // Третий переспрос
+];
 
 app.post("/call", async (req, res) => {
   const { to } = req.body;
@@ -61,6 +73,7 @@ app.post("/api/webhooks/twiml", (req, res) => {
     const callData = {
       to,
       dialog: [{ from: "ai", text: startMessage }],
+      silenceCount: 0, // 🎯 Счетчик переспросов при молчании
     };
 
     activeCalls.set(callSid, callData);
@@ -79,7 +92,6 @@ app.post("/api/webhooks/twiml", (req, res) => {
   }
 });
 
-// Action callback после завершения ConversationRelay
 app.post("/connect-action", (req, res) => {
   const VoiceResponse = require("twilio").twiml.VoiceResponse;
 
@@ -92,7 +104,6 @@ app.post("/connect-action", (req, res) => {
     console.log(`📋 HandoffData: ${HandoffData}`);
   }
 
-  // Завершаем звонок через SDK
   const response = new VoiceResponse();
   response.say(
     {
@@ -106,26 +117,149 @@ app.post("/connect-action", (req, res) => {
   res.send(response.toString());
 });
 
-// WebSocket сервер для ConversationRelay
+// 🎯 ФУНКЦИЯ ОЧИСТКИ ЗАВИСШЕГО ЗВОНКА
+function cleanupCall(callSid, reason = "timeout") {
+  console.log(`🧹 Очистка звонка ${callSid}. Причина: ${reason}`);
+
+  if (activeCalls.has(callSid)) {
+    activeCalls.delete(callSid);
+    console.log(`🗑️ Звонок ${callSid} удален из активных`);
+  }
+
+  if (callTimeouts.has(callSid)) {
+    const timeoutId = callTimeouts.get(callSid);
+    clearTimeout(timeoutId);
+    callTimeouts.delete(callSid);
+    console.log(`⏰ Таймаут для ${callSid} очищен`);
+  }
+
+  // 🎯 ОЧИЩАЕМ ТАЙМАУТ МОЛЧАНИЯ
+  if (silenceTimeouts.has(callSid)) {
+    const silenceTimeoutId = silenceTimeouts.get(callSid);
+    clearTimeout(silenceTimeoutId);
+    silenceTimeouts.delete(callSid);
+    console.log(`🤫 Таймаут молчания для ${callSid} очищен`);
+  }
+
+  if (pendingCalls.has(callSid)) {
+    pendingCalls.delete(callSid);
+  }
+}
+
+// 🎯 ФУНКЦИЯ УСТАНОВКИ ТАЙМЕРА МОЛЧАНИЯ
+function setSilenceTimer(callSid, ws, timeoutTime = SILENCE_TIMEOUT) {
+  // Очищаем предыдущий таймер молчания если есть
+  if (silenceTimeouts.has(callSid)) {
+    clearTimeout(silenceTimeouts.get(callSid));
+  }
+
+  const silenceTimeoutId = setTimeout(() => {
+    console.log(`🤫 Обнаружено молчание клиента для ${callSid}`);
+
+    const callData = activeCalls.get(callSid);
+    if (!callData) {
+      console.log(`❌ CallData не найден для ${callSid}, пропускаем`);
+      return;
+    }
+
+    // Увеличиваем счетчик молчания
+    callData.silenceCount++;
+
+    console.log(`🔄 Переспрос #${callData.silenceCount} для ${callSid}`);
+
+    if (callData.silenceCount <= MAX_SILENCE_PROMPTS) {
+      // Берем фразу переспроса
+      const promptIndex = Math.min(
+        callData.silenceCount - 1,
+        silencePrompts.length - 1
+      );
+      const silencePrompt = silencePrompts[promptIndex];
+
+      // Добавляем в диалог
+      callData.dialog.push({ from: "ai", text: silencePrompt });
+
+      console.log(`🤖 Переспрашиваем: "${silencePrompt}"`);
+
+      // Отправляем переспрос
+      if (ws.readyState === ws.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "text",
+            token: silencePrompt,
+            last: true,
+          })
+        );
+
+        // 🎯 УСТАНАВЛИВАЕМ НОВЫЙ ТАЙМЕР МОЛЧАНИЯ
+        setSilenceTimer(callSid, ws);
+      }
+    } else {
+      // Превышен лимит переспросов - завершаем звонок
+      console.log(
+        `❌ Превышен лимит переспросов для ${callSid} - завершаем звонок`
+      );
+
+      const goodbyeMessage =
+        "Zdá sa, že sa spojenie prerušilo. Ďakujem za váš čas. Dovidenia!";
+      callData.dialog.push({ from: "ai", text: goodbyeMessage });
+
+      if (ws.readyState === ws.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "text",
+            token: goodbyeMessage,
+            last: true,
+          })
+        );
+
+        // Завершаем через 3 секунды
+        setTimeout(() => {
+          if (ws.readyState === ws.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "end",
+                handoffData: JSON.stringify({
+                  reason: "client_silence_timeout",
+                  timestamp: new Date().toISOString(),
+                  silenceCount: callData.silenceCount,
+                  finalDialog: callData.dialog,
+                }),
+              })
+            );
+          }
+        }, 3000);
+      }
+
+      // Очищаем данные
+      cleanupCall(callSid, "silence_timeout");
+    }
+  }, timeoutTime);
+
+  // Сохраняем ID таймера молчания
+  silenceTimeouts.set(callSid, silenceTimeoutId);
+  console.log(
+    `🤫 Установлен таймер молчания ${timeoutTime / 1000}сек для ${callSid}`
+  );
+}
+
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws, req) => {
   console.log("🔌 ConversationRelay WebSocket подключен");
 
   let currentCallSid = null;
+  let conversationEnded = false;
 
   ws.on("message", async (data) => {
     let msg;
     try {
       msg = JSON.parse(data);
+      // console.log("[MESSAGE] -", msg);
     } catch (e) {
       console.error("❌ Невозможно распарсить сообщение:", e);
       return;
     }
 
-    // console.log("📨 Получено сообщение:", msg);
-
-    // Обработка разных типов сообщений от ConversationRelay
     switch (msg.type) {
       case "setup":
         console.log(
@@ -133,6 +267,29 @@ wss.on("connection", (ws, req) => {
         );
 
         currentCallSid = msg.callSid;
+
+        // 🎯 УСТАНАВЛИВАЕМ ОСНОВНОЙ ТАЙМАУТ
+        const timeoutId = setTimeout(() => {
+          console.log(
+            `⏰ Таймаут истек для звонка ${currentCallSid} - принудительно завершаем`
+          );
+
+          if (ws.readyState === ws.OPEN) {
+            console.log(
+              `🔌 Принудительно закрываем WebSocket для ${currentCallSid}`
+            );
+            ws.close(1000, "Call timeout exceeded");
+          }
+
+          cleanupCall(currentCallSid, "timeout_exceeded");
+        }, CALL_TIMEOUT);
+
+        callTimeouts.set(currentCallSid, timeoutId);
+        console.log(
+          `⏰ Установлен таймаут ${
+            CALL_TIMEOUT / 1000 / 60
+          } минут для звонка ${currentCallSid}`
+        );
 
         ws.send(
           JSON.stringify({
@@ -142,14 +299,18 @@ wss.on("connection", (ws, req) => {
           })
         );
 
-        // Можно отправить дополнительные параметры или настройки
-        if (msg.customParameters) {
-          console.log("🔧 Кастомные параметры:", msg.customParameters);
-        }
+        setSilenceTimer(currentCallSid, ws, 18);
+
         break;
 
       case "prompt":
-        // Клиент что-то сказал - получили готовый текст
+        if (conversationEnded) {
+          console.log(
+            "⚠️ Разговор уже завершен, игнорируем новое сообщение от клиента"
+          );
+          return;
+        }
+
         const userText = msg.voicePrompt;
         const language = msg.lang;
         const isComplete = msg.last;
@@ -161,6 +322,18 @@ wss.on("connection", (ws, req) => {
           return;
         }
 
+        // 🎯 КЛИЕНТ ОТВЕТИЛ - СБРАСЫВАЕМ СЧЕТЧИК МОЛЧАНИЯ
+        if (silenceTimeouts.has(currentCallSid)) {
+          clearTimeout(silenceTimeouts.get(currentCallSid));
+          silenceTimeouts.delete(currentCallSid);
+          console.log(
+            `🗣️ Клиент ответил, сбрасываем таймер молчания для ${currentCallSid}`
+          );
+        }
+
+        // Сбрасываем счетчик молчания при любом ответе клиента
+        currentCallData.silenceCount = 0;
+
         currentCallData.dialog.push({ from: "client", text: userText });
 
         console.log(
@@ -169,67 +342,89 @@ wss.on("connection", (ws, req) => {
 
         if (isComplete) {
           try {
-            // Генерируем ответ через вашу функцию
-            const result = await generateReply(
+            // 🚀 ИСПОЛЬЗУЕМ STREAMING ВЕРСИЮ ВМЕСТО ОБЫЧНОЙ
+            console.log("🎬 Переключаемся на streaming генерацию...");
+
+            const result = await generateReplyWithStreaming(
               userText,
               currentCallData.dialog,
-              borrower
+              borrower,
+              ws // Передаем WebSocket для отправки чанков
             );
+
             const reply = result.reply;
             const shouldEndCall = result.shouldEndCall;
 
+            // Добавляем полный ответ в диалог
             currentCallData.dialog.push({ from: "ai", text: reply });
 
             console.log(
-              `[${new Date().toISOString()}] 🤖 АИ сказал: "${reply}"`
+              `[${new Date().toISOString()}] 🤖 АИ сказал (streaming): "${reply}"`
             );
 
-            // Отправляем текстовый ответ ConversationRelay
-            ws.send(
-              JSON.stringify({
-                type: "text",
-                token: reply,
-                last: true,
-              })
-            );
+            if (!shouldEndCall) {
+              console.log(
+                "🤫 Устанавливаем таймер молчания после streaming ответа"
+              );
+              setSilenceTimer(currentCallSid, ws);
+            }
 
             if (shouldEndCall) {
               console.log("🏁 Инициируем завершение разговора...");
 
+              conversationEnded = true;
+              cleanupCall(currentCallSid, "normal_completion");
+
               setTimeout(() => {
-                ws.send(
-                  JSON.stringify({
-                    type: "end",
-                    handoffData: JSON.stringify({
-                      reason: "client_goodbye",
-                      timestamp: new Date().toISOString(),
-                      finalDialog: currentCallData.dialog,
-                    }),
-                  })
-                );
+                if (ws.readyState === ws.OPEN) {
+                  ws.send(
+                    JSON.stringify({
+                      type: "end",
+                      handoffData: JSON.stringify({
+                        reason: "conversation_completed",
+                        timestamp: new Date().toISOString(),
+                        finalDialog: currentCallData.dialog,
+                      }),
+                    })
+                  );
+                }
               }, 3000);
             }
+
+            // 🎯 ВРЕМЕННО НЕ УСТАНАВЛИВАЕМ ТАЙМЕР МОЛЧАНИЯ
+            // setSilenceTimer(currentCallSid, ws);
           } catch (error) {
             console.error("❌ Ошибка генерации ответа:", error);
 
-            // Отправляем сообщение об ошибке
+            // В случае ошибки streaming отправляем обычным способом
+            const errorMessage =
+              "Извините, произошла ошибка. Попробуйте еще раз.";
+
             ws.send(
               JSON.stringify({
                 type: "text",
-                token: "Извините, произошла ошибка. Попробуйте еще раз.",
+                token: errorMessage,
                 last: true,
               })
             );
+
+            // НЕ устанавливаем таймер молчания после ошибки
           }
         }
         break;
 
       case "dtmf":
-        // Клиент нажал кнопку на телефоне
+        if (conversationEnded) {
+          console.log("⚠️ Разговор завершен, игнорируем DTMF");
+          return;
+        }
+
         console.log(`📱 DTMF: ${msg.digit}`);
 
-        // Можно обработать нажатия (например, 0 для связи с оператором)
         if (msg.digit === "0") {
+          conversationEnded = true;
+          cleanupCall(currentCallSid, "dtmf_transfer");
+
           ws.send(
             JSON.stringify({
               type: "text",
@@ -238,30 +433,29 @@ wss.on("connection", (ws, req) => {
             })
           );
 
-          // Завершаем сессию с данными для передачи
           setTimeout(() => {
-            ws.send(
-              JSON.stringify({
-                type: "end",
-                handoffData: JSON.stringify({
-                  reason: "operator_request",
-                  timestamp: new Date().toISOString(),
-                }),
-              })
-            );
+            if (ws.readyState === ws.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "end",
+                  handoffData: JSON.stringify({
+                    reason: "operator_request",
+                    timestamp: new Date().toISOString(),
+                  }),
+                })
+              );
+            }
           }, 2000);
         }
         break;
 
       case "interrupt":
-        // Клиент прервал воспроизведение
         console.log(
           `🛑 Прервано на: "${msg.utteranceUntilInterrupt}" через ${msg.durationUntilInterruptMs}ms`
         );
         break;
 
       case "error":
-        // Ошибка от ConversationRelay
         console.error(`❌ Ошибка ConversationRelay: ${msg.description}`);
         break;
 
@@ -272,28 +466,52 @@ wss.on("connection", (ws, req) => {
 
   ws.on("error", (err) => {
     console.error("❌ Ошибка WebSocket ConversationRelay:", err);
+
+    if (currentCallSid) {
+      cleanupCall(currentCallSid, "websocket_error");
+    }
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code, reason) => {
+    console.log(
+      `🔌 ConversationRelay WebSocket закрыт. Код: ${code}, Причина: ${reason}`
+    );
+
     const callData = activeCalls.get(currentCallSid);
 
-    if (callData) {
+    if (callData && !conversationEnded) {
       console.log(
         "Финальный диалог:",
         JSON.stringify(callData.dialog, null, 2)
       );
-      // Здесь ваш код сохранения
-      activeCalls.delete(currentCallSid); // Очищаем память
     }
 
-    console.log("🔌 ConversationRelay WebSocket отключен");
+    if (currentCallSid) {
+      cleanupCall(currentCallSid, "websocket_closed");
+    }
   });
 });
 
-// Создаем HTTP сервер
+// 🎯 СТАТИСТИКА КАЖДУЮ МИНУТУ
+setInterval(() => {
+  const now = Date.now();
+  const activeCallsCount = activeCalls.size;
+  const timeoutsCount = callTimeouts.size;
+  const silenceTimeoutsCount = silenceTimeouts.size;
+
+  console.log(
+    `📊 Статистика: Звонки: ${activeCallsCount}, Таймауты: ${timeoutsCount}, Молчание: ${silenceTimeoutsCount}`
+  );
+
+  if (activeCallsCount !== timeoutsCount) {
+    console.warn(
+      `⚠️ Обнаружено расхождение в таймаутах: ${activeCallsCount} vs ${timeoutsCount}`
+    );
+  }
+}, 60000);
+
 const server = createServer(app);
 
-// Обработка WebSocket upgrade для ConversationRelay
 server.on("upgrade", (req, socket, head) => {
   console.log("🔄 WebSocket upgrade запрос:", req.url);
 
@@ -310,4 +528,24 @@ server.listen(PORT, () => {
   console.log(`🚀 Server запущен на порту ${PORT}`);
   console.log(`📡 WebSocket endpoint: ${process.env.PUBLIC_WS}/conversation`);
   console.log(`🌐 HTTP endpoint: ${process.env.PUBLIC_HOST}`);
+});
+
+process.on("SIGINT", () => {
+  console.log("\n🛑 Получен SIGINT. Очищаем таймауты...");
+
+  for (const [callSid, timeoutId] of callTimeouts) {
+    clearTimeout(timeoutId);
+  }
+
+  for (const [callSid, silenceTimeoutId] of silenceTimeouts) {
+    clearTimeout(silenceTimeoutId);
+  }
+
+  callTimeouts.clear();
+  silenceTimeouts.clear();
+  activeCalls.clear();
+  pendingCalls.clear();
+
+  console.log("✅ Очистка завершена. Остановка сервера...");
+  process.exit(0);
 });

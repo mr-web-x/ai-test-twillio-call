@@ -1,54 +1,154 @@
-/**
- * Анализирует текст клиента на предмет ЯВНОГО намерения завершить разговор
- * @param {string} clientText - текст клиента
- * @returns {boolean} - true если клиент ЯВНО прощается или просит завершить звонок
- */
-function isGoodbyeIntent(clientText) {
-  if (!clientText || typeof clientText !== "string") {
+function isGoodbyeIntent(aiText) {
+  if (!aiText || typeof aiText !== "string") {
     return false;
   }
 
   // Приводим к нижнему регистру для анализа
-  const text = clientText.toLowerCase().trim();
+  const text = aiText.toLowerCase().trim();
 
-  // ТОЛЬКО явные прощания и просьбы завершить звонок
-  const explicitGoodbyePatterns = [
-    // Прямые прощания
-    /\b(dovidenia|zbohom|čau)\b/,
+  // ЗАВЕРШАЮЩИЕ ФРАЗЫ AI АГЕНТА ЛЕНКИ
+  const aiGoodbyePatterns = [
+    // === ОСНОВНЫЕ ЗАВЕРШАЮЩИЕ ФРАЗЫ ===
 
-    // Явные просьбы завершить звонок
-    /\b(zavesím|zavešujem)\b/,
-    /\b(ukončujem\s+(hovor|rozhovor))\b/,
-    /\b(končím\s+(hovor|rozhovor))\b/,
+    // "Prajem pekný deň" и вариации
+    /\b(prajem\s+(pekný|príjemný)\s+deň)\b/,
+    /\b(pekný\s+deň)\b/,
+    /\b(príjemný\s+deň)\b/,
 
-    // Категорические просьбы не звонить
-    /\b(nevolajte\s+(mi|už|viac))\b/,
-    /\b(prestať\s+volať)\b/,
-    /\b(nepotrebujem\s+(vaše\s+)?služby)\b/,
+    // "Dovidenia" и вариации
+    /\b(dovidenia)\b/,
+    /\b(zbohom)\b/,
 
-    // Явные отказы с просьбой оставить в покое
-    /\b(nechajte\s+ma\s+(na\s+)?pokoji)\b/,
-    /\b(neobťažujte\s+ma)\b/,
+    // === ФРАЗЫ УСПЕШНОЙ ДОГОВОРЕННОСТИ ===
+
+    // "Ďakujem za spoluprácu"
+    /\b(ďakujem\s+za\s+spoluprácu)\b/,
+    /\b(ďakujem\s+za\s+pochopenie)\b/,
+    /\b(ďakujem\s+za\s+(váš\s+)?čas)\b/,
+
+    // "Očakávame splátku"
+    /\b(očakávame\s+(prvú\s+)?splátku)\b/,
+    /\b(teším\s+sa\s+na\s+(vašu\s+)?(prvú\s+)?splátku)\b/,
+
+    // "Dohodli sme sa"
+    /\b(dohodli\s+sme\s+sa)\b/,
+    /\b(výborne[,]?\s+(dohodli\s+sme\s+sa)?)\b/,
+
+    // === ФРАЗЫ ПРИ ОТКАЗЕ КЛИЕНТА ===
+
+    // "Rozumiem vašej situácii"
+    /\b(rozumiem\s+(vašej\s+)?situácii)\b/,
+    /\b(chápem\s+(vašu\s+situáciu)?)\b/,
+
+    // "Ak sa niečo zmení"
+    /\b(ak\s+sa\s+(niečo\s+)?zmení[,]?\s+kontaktujte\s+nás)\b/,
+    /\b(ak\s+budete\s+potrebovať\s+pomoc)\b/,
+    /\b(ak\s+sa\s+rozhodnete[,]?\s+môžete\s+nás\s+kontaktovať)\b/,
+
+    // === КОРОТКИЕ ЗАВЕРШАЮЩИЕ ФРАЗЫ ===
+
+    // "Neváhajte ma kontaktovať"
+    /\b(neváhajte\s+(ma\s+)?kontaktovať)\b/,
+    /\b(môžete\s+(ma\s+)?kontaktovať)\b/,
+
+    // === ПАТТЕРНЫ ПОСЛЕДОВАТЕЛЬНОСТИ ===
+
+    // Фразы содержащие "ďakujem" + завершение
+    /\b(ďakujem.*dovidenia)\b/,
+    /\b(ďakujem.*pekný\s+deň)\b/,
+
+    // Фразы содержащие завершение + благодарность
+    /\b(prajem.*ďakujem)\b/,
+    /\b(dovidenia.*ďakujem)\b/,
   ];
 
-  // Проверяем только явные паттерны прощаний
-  for (const pattern of explicitGoodbyePatterns) {
+  // === ТОЧНЫЕ КОРОТКИЕ ФРАЗЫ ===
+  const exactGoodbyePhrases = [
+    "dovidenia",
+    "dovidenia!",
+    "ďakujem, dovidenia",
+    "ďakujem, dovidenia!",
+    "pekný deň",
+    "pekný deň!",
+    "prajem pekný deň",
+    "prajem pekný deň!",
+    "prajem príjemný deň",
+    "prajem príjemný deň!",
+    "zbohom",
+    "zbohom!",
+    "ďakujem a dovidenia",
+    "ďakujem a dovidenia!",
+    "výborne, dovidenia",
+    "výborne, dovidenia!",
+  ];
+
+  // Проверяем точные фразы
+  if (exactGoodbyePhrases.includes(text)) {
+    return true;
+  }
+
+  // Проверяем паттерны
+  for (const pattern of aiGoodbyePatterns) {
     if (pattern.test(text)) {
       return true;
     }
   }
 
-  // Очень короткие явные прощания
-  if (
-    text === "dovidenia" ||
-    text === "zbohom" ||
-    text === "čau" ||
-    text === "pa"
-  ) {
+  // === ДОПОЛНИТЕЛЬНЫЕ ПРОВЕРКИ ===
+
+  // Проверяем комбинации ключевых слов
+  const hasThankYou = /\b(ďakujem)\b/.test(text);
+  const hasGoodbye = /\b(dovidenia|pekný\s+deň|príjemný\s+deň)\b/.test(text);
+  const hasCooperation = /\b(spoluprácu|pochopenie)\b/.test(text);
+  const hasExpectation = /\b(očakávame|teším\s+sa)\b/.test(text);
+
+  // Если есть благодарность + прощание = завершение
+  if (hasThankYou && hasGoodbye) {
+    return true;
+  }
+
+  // Если есть благодарность + сотрудничество + прощание = завершение
+  if (hasThankYou && hasCooperation) {
+    return true;
+  }
+
+  // Если есть ожидание + прощание = завершение
+  if (hasExpectation && hasGoodbye) {
     return true;
   }
 
   return false;
+}
+
+// === ДОПОЛНИТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ОПРЕДЕЛЕНИЯ ТИПА ЗАВЕРШЕНИЯ ===
+function getGoodbyeType(aiText) {
+  if (!isGoodbyeIntent(aiText)) {
+    return null;
+  }
+
+  const text = aiText.toLowerCase().trim();
+
+  // Успешная договоренность
+  if (/\b(dohodli\s+sme\s+sa|očakávame|teším\s+sa|spoluprácu)\b/.test(text)) {
+    return "AGREEMENT_SUCCESS";
+  }
+
+  // Понимание отказа
+  if (
+    /\b(rozumiem|chápem|ak\s+sa\s+zmení|ak\s+budete\s+potrebovať)\b/.test(text)
+  ) {
+    return "UNDERSTANDING_REFUSAL";
+  }
+
+  // Простое прощание
+  if (
+    /\b(dovidenia|pekný\s+deň|zbohom)\b/.test(text) &&
+    !/\b(ďakujem|spoluprácu|rozumiem)\b/.test(text)
+  ) {
+    return "SIMPLE_GOODBYE";
+  }
+
+  return "GENERAL_GOODBYE";
 }
 
 /**
@@ -113,13 +213,14 @@ function hasTooManyPersuasionAttempts(dialog) {
 
 /**
  * Главная функция анализа - нужно ли завершать разговор (только при явных прощаниях)
- * @param {string} clientText - последний текст клиента
+ * @param {string} text - последний текст клиента
  * @param {Array} dialog - история диалога
  * @returns {Object} - результат анализа
  */
-function shouldEndConversation(clientText, dialog) {
-  const isExplicitGoodbye = isGoodbyeIntent(clientText);
+function shouldEndConversation(text, dialog) {
+  const isExplicitGoodbye = isGoodbyeIntent(text);
   const tooManyAttempts = hasTooManyPersuasionAttempts(dialog);
+  const goodbyeType = getGoodbyeType(text);
 
   const shouldEnd = isExplicitGoodbye || tooManyAttempts;
 
@@ -131,6 +232,7 @@ function shouldEndConversation(clientText, dialog) {
       ? "conversation_too_long"
       : "continue",
     goodbyeMessage: shouldEnd ? generateGoodbyeMessage() : null,
+    goodbyeType,
   };
 }
 
