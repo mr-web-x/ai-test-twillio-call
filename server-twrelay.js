@@ -12,10 +12,20 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(express.static("public"));
 
+const borrower = {
+  name: "Dmitry Novak",
+  summCredit: 500,
+  days: 30,
+  prosrochka: 12,
+  vernut: 512,
+};
+
+//Radi by sme s vami prediskutovali otázku vašej neuhradenej dlžoby. Tento hovor bude zaznamenávaný za účelom zlepšenia kvality služieb.
+
 const pendingCalls = new Map();
 const activeCalls = new Map();
 const startMessage =
-  "Dobrý deň, volám sa Lenka. Zastupujem oddelenie vymáhania pohľadávok. Radi by sme s vami prediskutovali otázku vašej neuhradenej dlžoby. Tento hovor bude zaznamenávaný za účelom zlepšenia kvality služieb. Prosím, potvrďte, že môžete hovoriť.";
+  "Dobrý deň, volám sa Lenka. Zastupujem oddelenie vymáhania pohľadávok. Prosím, potvrďte, že môžete hovoriť.";
 
 app.post("/call", async (req, res) => {
   const { to } = req.body;
@@ -60,7 +70,7 @@ app.post("/api/webhooks/twiml", (req, res) => {
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
               <Response>
                   <Connect>
-                      <ConversationRelay url="${process.env.PUBLIC_WS}/conversation" transcriptionLanguage="sk-SK" transcriptionProvider="Deepgram" ttsProvider="google" voice="sk-SK-Wavenet-B" welcomeGreeting="${startMessage}">
+                      <ConversationRelay debug="True" url="${process.env.PUBLIC_WS}/conversation" transcriptionLanguage="sk-SK" transcriptionProvider="Deepgram" ttsProvider="google" voice="sk-SK-Wavenet-B" welcomeGreeting="${startMessage}">
                       </ConversationRelay>
                   </Connect>
               </Response>`);
@@ -132,14 +142,6 @@ wss.on("connection", (ws, req) => {
           })
         );
 
-        // ws.send(
-        //   JSON.stringify({
-        //     type: "text",
-        //     token: startMessage,
-        //     last: true,
-        //   })
-        // );
-
         // Можно отправить дополнительные параметры или настройки
         if (msg.customParameters) {
           console.log("🔧 Кастомные параметры:", msg.customParameters);
@@ -168,7 +170,14 @@ wss.on("connection", (ws, req) => {
         if (isComplete) {
           try {
             // Генерируем ответ через вашу функцию
-            const reply = await generateReply(userText, currentCallData.dialog);
+            const result = await generateReply(
+              userText,
+              currentCallData.dialog,
+              borrower
+            );
+            const reply = result.reply;
+            const shouldEndCall = result.shouldEndCall;
+
             currentCallData.dialog.push({ from: "ai", text: reply });
 
             console.log(
@@ -183,6 +192,23 @@ wss.on("connection", (ws, req) => {
                 last: true,
               })
             );
+
+            if (shouldEndCall) {
+              console.log("🏁 Инициируем завершение разговора...");
+
+              setTimeout(() => {
+                ws.send(
+                  JSON.stringify({
+                    type: "end",
+                    handoffData: JSON.stringify({
+                      reason: "client_goodbye",
+                      timestamp: new Date().toISOString(),
+                      finalDialog: currentCallData.dialog,
+                    }),
+                  })
+                );
+              }, 3000);
+            }
           } catch (error) {
             console.error("❌ Ошибка генерации ответа:", error);
 
